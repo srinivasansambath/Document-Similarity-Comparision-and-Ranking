@@ -1,0 +1,202 @@
+# app.py
+
+import streamlit as st
+import zipfile
+import io
+import smtplib
+from email.message import EmailMessage
+from PyPDF2 import PdfReader
+from sentence_transformers import SentenceTransformer, util
+import pandas as pd
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+import datetime
+
+# --- DB Setup ---
+engine = create_engine("sqlite:///genai.db")
+Base = declarative_base()
+Session = sessionmaker(bind=engine)
+db_session = Session()
+
+class JDRecord(Base):
+    __tablename__ = "jd_records"
+    id = Column(Integer, primary_key=True)
+    jd_text = Column(Text)
+    uploaded_by = Column(String(50))
+    match_status = Column(String(20), default="In Progress")
+    top_matches_status = Column(String(20), default="Not Found")
+    email_status = Column(String(20), default="Pending")
+    total_profiles = Column(Integer, default=0)
+    matched_profiles = Column(Integer, default=0)
+    non_matched_profiles = Column(Integer, default=0)
+    timestamp = Column(DateTime, default=datetime.datetime.utcnow)
+
+Base.metadata.create_all(engine)
+
+# --- Login  ---
+users = {
+    "ar_user": {"password": "ar123", "role": "AR", "email": "ar@gmail.com"},
+    "recruiter_user": {"password": "rec123", "role": "Recruiter", "email": "rec@gmail.com"}
+}
+
+# --- Utility Functions ---
+def send_email(to_email, subject, body):
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg['Subject'] = subject
+    msg['From'] = "rec@gmail.com"
+    msg['To'] = to_email
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
+        smtp.login("rec@gmail.com", "app password") --replace your app password here
+        smtp.send_message(msg)
+
+@st.cache_data
+def extract_text(file):
+    reader = PdfReader(file)
+    return ''.join([page.extract_text() or '' for page in reader.pages])
+
+# --- Login System ---
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if not st.session_state.logged_in:
+    st.title("Login")
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+    if st.button("Login"):
+        user = users.get(username)
+        if user and user["password"] == password:
+            st.session_state.logged_in = True
+            st.session_state.role = user["role"]
+            st.session_state.username = username
+            st.success(f"Welcome {username} ({st.session_state.role})")
+            st.rerun()
+        else:
+            st.error("Invalid credentials")
+
+else:
+    role = st.session_state.role
+    username = st.session_state.username
+    user_email = users[username]["email"]
+    st.sidebar.write(f"Logged in as: {username} ({role})")
+    st.sidebar.button("Logout", on_click=lambda: st.session_state.clear())
+    st.title("Talent MatchAI")
+
+    # --- AR REQUESTOR DASHBOARD ---
+    if role == "AR":
+        st.header("Upload Job Description (JD)")
+        jd_file = st.file_uploader("Upload Job Description (PDF)", type="pdf")
+
+        if st.button("Submit JD") and jd_file:
+            jd_text = extract_text(jd_file)
+            record = JDRecord(
+                jd_text=jd_text[:200],
+                uploaded_by=username,
+                match_status="In Progress",
+                top_matches_status="Not Found",
+                email_status="Pending"
+            )
+            db_session.add(record)
+            db_session.commit()
+            st.success("JD Uploaded Successfully and Awaiting Recruiter Matching")
+
+        st.header("JD Status Tracker")
+        jd_records = db_session.query(JDRecord).filter_by(uploaded_by=username).order_by(JDRecord.timestamp.desc()).all()
+        for record in jd_records:
+            st.write(f"JD ID: {record.id}")
+            st.write(f"Uploaded At: {record.timestamp}")
+            st.write(f"JD Comparison Status: {record.match_status}")
+            st.write(f"Top 3 Matches: {record.top_matches_status}")
+            st.write(f"Email Notification Status: {record.email_status}")
+            st.markdown("---")
+
+    # --- RECRUITER DASHBOARD ---
+    if role == "Recruiter":
+        #st.header("Talent MatchAI")
+        st.header("Select JD for Matching")
+        pending_jds = db_session.query(JDRecord).filter_by(match_status="In Progress").all()
+        if pending_jds:
+            jd_selected = st.selectbox("Select JD ID", [f"{jd.id}: {jd.jd_text[:50]}" for jd in pending_jds])
+            jd_id = int(jd_selected.split(":")[0])
+            selected_jd = db_session.query(JDRecord).filter_by(id=jd_id).first()
+            st.code(selected_jd.jd_text[:500])
+
+            resume_upload = st.file_uploader("Upload Consultant Profiles (PDFs or ZIP)", type=["pdf", "zip"], accept_multiple_files=True)
+
+            if st.button("Run Matching") and resume_upload:
+                profiles = {}
+                for file in resume_upload:
+                    if file.name.endswith(".zip"):
+                        with zipfile.ZipFile(file) as zipf:
+                            for zipinfo in zipf.infolist():
+                                if zipinfo.filename.endswith(".pdf"):
+                                    extracted = zipf.read(zipinfo)
+                                    reader = PdfReader(io.BytesIO(extracted))
+                                    text = ''.join([page.extract_text() or '' for page in reader.pages])
+                                    profiles[zipinfo.filename] = text
+                    elif file.name.endswith(".pdf"):
+                        profiles[file.name] = extract_text(file)
+
+                model = SentenceTransformer('all-MiniLM-L6-v2')
+                jd_embedding = model.encode(selected_jd.jd_text, convert_to_tensor=True)
+                profile_embeddings = {
+                    name: model.encode(text, convert_to_tensor=True)
+                    for name, text in profiles.items()
+                }
+
+                ranked = sorted(
+                    [(name, float(util.cos_sim(jd_embedding, emb))) for name, emb in profile_embeddings.items()],
+                    key=lambda x: x[1], reverse=True
+                )
+
+                MATCH_THRESHOLD = 0.5
+                matches = [(name, score) for name, score in ranked if score >= MATCH_THRESHOLD]
+                non_matches = [(name, score) for name, score in ranked if score < MATCH_THRESHOLD]
+
+                # Update JD record
+                selected_jd.match_status = "Completed"
+                selected_jd.total_profiles = len(profiles)
+                selected_jd.matched_profiles = len(matches)
+                selected_jd.non_matched_profiles = len(non_matches)
+                selected_jd.top_matches_status = "Listed" if matches else "Not Found"
+                selected_jd.email_status = "Sent"
+                db_session.commit()
+
+                # Send email to AR Requestor
+                ar_email = users[selected_jd.uploaded_by]["email"]
+                email_body = "Top Matches:\n" + '\n'.join([f"{i+1}. {name} - {score:.2f}" for i, (name, score) in enumerate(matches[:3])])
+                send_email(ar_email, "Top Matches from JD Matcher", email_body)
+
+                # --- Display Results ---
+                st.subheader("Matching Results")
+
+                # 1. Top 3 Matching Profiles
+                st.markdown("### Top 3 Matching Profiles")
+                top_matches = matches[:3]
+                if top_matches:
+                    for i, (name, score) in enumerate(top_matches):
+                        st.write(f"{i+1}. {name} - Score: {score:.2f}")
+                else:
+                    st.warning("No profiles matched the threshold.")
+
+                # 2. Unmatched Profiles
+                st.markdown("### Unmatched Profiles")
+                if non_matches:
+                    for i, (name, score) in enumerate(non_matches):
+                        st.write(f"{i+1}. {name} - Score: {score:.2f}")
+                else:
+                    st.info("All profiles matched the threshold.")
+
+                # 3. All Similarity Scores
+                st.markdown("### All Profiles Similarity Scores")
+                df_scores = pd.DataFrame(ranked, columns=["Profile Name", "Similarity Score"])
+                try:
+                    st.dataframe(df_scores.style.background_gradient(cmap='Greens', subset=["Similarity Score"]))
+                except:
+                    st.dataframe(df_scores)
+
+                # 4. Show Email Info
+                st.success(f" Email has been sent to AR Requestor at: `{ar_email}`")
+        else:
+            st.info("No pending JDs available for matching.")
